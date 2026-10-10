@@ -24,8 +24,27 @@ The `./tools/predef` and `./tools/graphics` imports are provided by Tradovate. N
 
 Tradovate's standard right-side volume profile is configured separately in chart settings.
 
+Load history back to the session opening for a complete profile. The indicator replays supplied history when its opening timestamp changes, including newly loaded opening bars.
+
+After changing between 1-minute and 5-minute charts, reload Tradovate. Live checks found that Tradovate can retain the previous `chartDescription.elementSize` until a reload. The script uses this documented interval metadata and does not guess an interval from gaps between sparse bars.
+
 ## Updates
 
 This private repository is the working source for future updates. Every accepted indicator change must be validated, committed, pushed, and published to the existing unlisted Tradovate community entry, retaining the installation link above. See [AGENTS.md](AGENTS.md) for the standing release instructions.
 
 A GitHub push does not update Tradovate by itself. Other logins install from the link above and apply available community updates.
+
+## Validation
+
+With Node.js and Git available, run from this repository:
+
+```text
+node --check AsiaSessionVolumeProfile.js
+node tests/profile-tests.js
+node tests/calculation-parity.js
+node tests/history-recovery.js
+```
+
+The parity suite compares the working indicator against the pinned pre-optimization Git revision. It checks exact numeric outputs, financial/reference state and final graphics across both chart intervals, warmed-up RVOL, DST, sparse data, calendar changes and runtime history resets. It requires that revision to be available locally (use a full clone, or provide baseline/candidate file paths).
+
+These local checks use small Tradovate API stubs. Confirm rendering and saved source in Tradovate before publishing.

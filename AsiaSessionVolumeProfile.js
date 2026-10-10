@@ -5,14 +5,17 @@
 const predef = require('./tools/predef');
 const {du, px, op} = require('./tools/graphics');
 const MIN = 60000;
+let nyDst;
 // US daylight-saving rules from 2007 onward; independent of browser locale.
 function ny(t) {
-    const stamp=new Date(t),year=stamp.getUTCFullYear();
-    const marchFirst=new Date(Date.UTC(year,2,1)).getUTCDay();
-    const novemberFirst=new Date(Date.UTC(year,10,1)).getUTCDay();
-    const start=Date.UTC(year,2,8+(7-marchFirst)%7,7);
-    const end=Date.UTC(year,10,1+(7-novemberFirst)%7,6);
-    const local=new Date(t-(t>=start && t<end?4:5)*3600000);
+    const year=new Date(t).getUTCFullYear();
+    // Bound the cache to one year, including when historical replays cross years.
+    if(!nyDst || nyDst.year!==year) {
+        const marchFirst=new Date(Date.UTC(year,2,1)).getUTCDay();
+        const novemberFirst=new Date(Date.UTC(year,10,1)).getUTCDay();
+        nyDst={year,start:Date.UTC(year,2,8+(7-marchFirst)%7,7),end:Date.UTC(year,10,1+(7-novemberFirst)%7,6)};
+    }
+    const local=new Date(t-(t>=nyDst.start && t<nyDst.end?4:5)*3600000);
     return {y:local.getUTCFullYear(),m:local.getUTCMonth()+1,d:local.getUTCDate(),minute:local.getUTCHours()*60+local.getUTCMinutes()};
 }
 function dateKey(a, shift) {return new Date(Date.UTC(a.y,a.m-1,a.d+(shift||0))).toISOString().slice(0,10);}
@@ -54,7 +57,7 @@ function add(p,b,step,duration) {
     while(p.rows.length<last-p.first+1)p.rows.push(0);
     for(let k=bottom;k<=top;k++) p.rows[k-p.first]+=b.v*(b.h===b.l?1:Math.max(0,Math.min(b.h,(k+1)*step)-Math.max(b.l,k*step))/(b.h-b.l));
     p.total+=b.v;p.pv+=(b.h+b.l+b.c)/3*b.v;p.observed++;p.last=b.t+duration;p.endIndex=b.index;p.reason=p.total>0?'Ready':'Waiting for volume';
-    p.cumulative.push({minute:session(b.t).minute,total:p.total});
+    p.cumulative.push({minute:ny(b.t).minute,total:p.total});
     p.complete=ny(b.t+duration).minute===(p.kind==='US'?960:570);
 }
 function bar(d,index) {return {t:+new Date(d.timestamp()),h:d.high(),l:d.low(),c:d.close(),o:d.open(),v:d.volume(),index:d.index(),sequence:index,tradeDate:typeof d.tradeDate==='function'?d.tradeDate():undefined};}
@@ -83,8 +86,8 @@ function tradingDate(b) {
     const local=ny(b.t);
     return dateKey(local,local.minute>=1080?1:0);
 }
-function referenceKeys(day) {
-    const date=new Date(day+'T12:00:00Z'),weekday=date.getUTCDay();
+function referenceKeys(day,date=new Date(day+'T12:00:00Z')) {
+    const weekday=date.getUTCDay();
     const monday=new Date(+date-((weekday+6)%7)*86400000).toISOString().slice(0,10);
     return {D:day,W:monday,M:day.slice(0,7),Q:day.slice(0,4)+'-Q'+(Math.floor((date.getUTCMonth())/3)+1),Y:day.slice(0,4)};
 }
@@ -113,9 +116,11 @@ function rangeClock(t,zone) {
 class ReferenceOverlays {
     constructor(props,tick,duration) {this.props=props;this.tick=tick;this.duration=duration;this.periods={};this.ranges={};this.previousBar=null;this.monday=null;this.zoneHistory=[];this.historyKeys=[];}
     update(b,a) {
-        const props=this.props,day=tradingDate(b),keys=referenceKeys(day),date=new Date(day+'T12:00:00Z');
-        const dow=date.getUTCDay(),atOpen=ny(b.t).minute===1080,old=this.previousBar;
-        const tail=old && ny(old.t+this.duration).minute===1020;
+        const props=this.props,day=tradingDate(b),date=new Date(day+'T12:00:00Z'),keys=referenceKeys(day,date);
+        const dow=date.getUTCDay(),minute=ny(b.t).minute,atOpen=minute===1080,old=this.previousBar;
+        const oldCloseMinute=old?ny(old.t+this.duration).minute:null;
+        const tail=old && oldCloseMinute===1020;
+        const missingWithinDay=old && tradingDate(old)===day && b.t-old.t>this.duration && !(oldCloseMinute===975 && minute===990);
         const firstBusiness=date.getUTCDate()===1 || (dow===1 && date.getUTCDate()<=3);
         Object.keys(keys).forEach(kind=>{
             let state=this.periods[kind];if(!state)state=this.periods[kind]={current:null,previous:null};
@@ -128,10 +133,7 @@ class ReferenceOverlays {
             } else {
                 // Unscheduled missing minutes within a trading date invalidate
                 // extrema. Overnight maintenance/weekend gaps are outside it.
-                if(old && tradingDate(old)===day && b.t-old.t>this.duration) {
-                    const closeMinute=ny(old.t+this.duration).minute;
-                    if(!(closeMinute===975 && ny(b.t).minute===990))p.good=false;
-                }
+                if(missingWithinDay)p.good=false;
                 p.h=Math.max(p.h,b.h);p.l=Math.min(p.l,b.l);p.c=b.c;p.last=b.t;p.day=day;
             }
             if(![b.o,b.h,b.l,b.c].every(Number.isFinite))p.good=false;
@@ -245,7 +247,7 @@ class AsiaSessionVolumeProfile {
         this.duration=([1,5].includes(this.minutes)?this.minutes:1)*MIN;
         this.inputWarning=null;this.drawCache=null;
         this.props=Object.assign({showDaily:true,dailyOpen:true,dailyRange:true,dailyMid:true,showWeekly:true,weeklyOpen:true,weeklyRange:true,weeklyMid:true,showMonthly:true,monthlyOpen:true,monthlyRange:true,monthlyMid:true,showQuarterly:true,quarterlyOpen:true,quarterlyRange:true,quarterlyMid:true,showYearly:true,yearlyOpen:true,yearlyRange:true,yearlyMid:true,showMonday:true,mondayMid:true,showPivots:true,showLondon:true,showNewYorkRange:true,showTokyo:true,showSessionBoxes:true,rightAnchoredReferences:true,mergeReferences:true,showReferenceLabels:true,referencePrices:true,showHistory:true,pivotP:true,pivotR1:true,pivotR2:true,pivotR3:true,pivotR4:true,pivotR5:true,pivotS1:true,pivotS2:true,pivotS3:true,pivotS4:true,pivotS5:true,londonStart:120,londonEnd:510,newYorkStart:510,newYorkEnd:1140,tokyoStart:1020,tokyoEnd:120,referenceLineWidth:1,referenceLabelBars:10,referenceAnchorBars:250,historySessions:5,settlementDate:0,settlementClose:0,dailyColor:'#29b6f6',weeklyColor:'#795500',monthlyColor:'#006B45',quarterlyColor:'#B3261E',yearlyColor:'#8E245D',mondayColor:'#455A64',pivotColor:'#B85C00',londonColor:'#AB47BC',newYorkColor:'#26a69a',tokyoColor:'#1976D2',pivotPeriod:'D',rangeTimezone:'America/Chicago'},this.props);this.tick=this.contractInfo.tickSize;this.step=this.tick*this.props.ticksPerRow;
-        this.active=null;this.completed=[];this.prior=null;this.lastValidUS=null;this.previous=null;this.processed=-1;
+        this.active=null;this.completed=[];this.prior=null;this.lastValidUS=null;this.previous=null;this.processed=-1;this.historyStart=null;
         this.future=null;this.fpv=0;this.fvol=0;this.fgood=false;this.fAbsent=0;
         this.above=0;this.below=0;this.context='Waiting for closed-bar context';this.area=null;
         this.tests={vah:false,poc:false,val:false};this.testsCovered=false;
@@ -288,8 +290,8 @@ class AsiaSessionVolumeProfile {
         if(gap>0 && !scheduled)this.testsCovered=false;
         if(this.prior) ['vah','poc','val'].forEach(k=>{const y=this.prior.levels[k];if(b.l<=y && b.h>=y)this.tests[k]=true;});
         if(this.future!==s.future){this.future=s.future;this.fpv=0;this.fvol=0;this.fgood=s.minute===1080;this.fAbsent=0;}
-        if(this.fgood && [b.h,b.l,b.c,b.v].every(Number.isFinite) && b.h>=b.l && b.v>=0){this.fpv+=(b.h+b.l+b.c)/3*b.v;this.fvol+=b.v;if(gap>0 && !scheduled)this.fAbsent+=gap/MIN;}
-        else if(![b.h,b.l,b.c,b.v].every(Number.isFinite) || b.h<b.l || b.v<0)this.fgood=false;
+        // The input guard above already validated these prices and volume.
+        if(this.fgood){this.fpv+=(b.h+b.l+b.c)/3*b.v;this.fvol+=b.v;if(gap>0 && !scheduled)this.fAbsent+=gap/MIN;}
         // NY context uses the profile snapshot available BEFORE this closed bar.
         const prevLevels=this.active?this.active.levels:null;
         const area=s.kind==='US' && !changed ? prevLevels : s.kind==='ON' && this.prior ? this.prior.levels:null;
@@ -312,23 +314,38 @@ class AsiaSessionVolumeProfile {
         let migration='POC warming up';
         if(dev){this.pocHistory.push(dev.poc);if(this.pocHistory.length>this.props.pocLookback+1)this.pocHistory.shift();if(this.pocHistory.length>this.props.pocLookback){const move=this.pocHistory[this.pocHistory.length-1]-this.pocHistory[0],threshold=Math.max(this.tick,this.props.pocMinMove);migration=move>=threshold?'POC higher':move<=-threshold?'POC lower':'POC stable';}}
         let rvol=null,samples=0;
-        if(p && p.good){const base=this.baselines[p.kind];const slot=p.cumulative.length-1;const sums=base.map(x=>x[slot]).filter(x=>x && x.minute===s.minute).map(x=>x.total);samples=sums.length;if(samples>=this.props.rvolMinSamples){const average=sums.reduce((a,v)=>a+v,0)/samples;if(average>0)rvol=p.total/average;}}
+        if(p && p.good) {
+            const base=this.baselines[p.kind],slot=p.cumulative.length-1;let sum=0;
+            // Retain the original session order and floating-point addition order.
+            for(let i=0;i<base.length;i++){const point=base[i][slot];if(point && point.minute===s.minute){sum+=point.total;samples++;}}
+            if(samples>=this.props.rvolMinSamples){const average=sum/samples;if(average>0)rvol=p.total/average;}
+        }
         const valueRelation=dev && this.prior ? dev.val>this.prior.levels.vah?'Value above prior US':dev.vah<this.prior.levels.val?'Value below prior US':dev.vah<=this.prior.levels.vah && dev.val>=this.prior.levels.val?'Value inside prior US':dev.vah>=this.prior.levels.vah && dev.val<=this.prior.levels.val?'Value spans prior US':'Value overlaps prior US':'Prior US comparison unavailable';
         this.snapshot={s,b,vwap,futures,area,location,migration,valueRelation,rvol,samples,priorAtr};this.references.update(b,this.snapshot);
         this.previous=b;
     }
     map(d,index,history) {
         // Tradovate can keep a calculator while changing its chart interval or
-        // prepending history. Replay supplied closed bars after either change;
+        // replacing/prepending history. Replay supplied closed bars after a change;
         // calculation formulas and duplicate protection remain unchanged.
         if(this.supported()) {
             let reset=Number(this.chartDescription.elementSize)!==this.minutes;
+            const first=history && typeof history.get==='function'?history.get(0):null;
+            const start=first?+new Date(first.timestamp()):NaN;
+            // The host can replace the opening prefix while retaining the latest
+            // sequence/timestamp. That still requires a complete history replay.
+            if(Number.isFinite(start) && this.historyStart!==null && start!==this.historyStart)reset=true;
             if(!reset && this.previous && history && typeof history.get==='function') {
                 const sequence=this.previous.sequence===undefined?this.previous.index:this.previous.sequence;
                 const anchor=history.get(sequence);
                 reset=!!anchor && +new Date(anchor.timestamp())!==this.previous.t;
+                if(!anchor && typeof history.size==='function') {
+                    const size=history.size();
+                    if(Number.isFinite(size) && size>=0 && sequence>=size)reset=true;
+                }
             }
             if(reset)this.init();
+            if(Number.isFinite(start))this.historyStart=start;
         }
         if(!this.supported())return d.isLast()?{graphics:{items:this.warning('Use a standard 1- or 5-minute chart')}}:{};
         // Repeated live updates never accumulate the current candle twice.
@@ -381,19 +398,19 @@ class AsiaSessionVolumeProfile {
         });
         const A=a.area;
         if(this.props.showZones && A && A.vah-A.val>=3*this.tick) {
-            const total=this.props.adaptiveWidth && a.priorAtr?Math.max(Math.min(this.props.minWidth,this.props.maxWidth),Math.min(Math.max(this.props.minWidth,this.props.maxWidth),a.priorAtr*this.props.atrFactor)):this.props.zoneWidth;
-            const half=g=>Math.max(this.tick,Math.floor(Math.min(total/2,g*.4)/this.tick)*this.tick);
+            const widths=zoneWidths(this.props,this.tick,A,a.priorAtr);
             const holdH=this.above>=this.props.acceptBars,holdL=this.below>=this.props.acceptBars;
-            const rows=[['vah',A.vah,half(A.vah-A.poc),holdH?this.props.buyColor:a.location===0?this.props.sellColor:this.props.neutralColor,holdH?'BUY?':a.location===0?'SELL?':'TEST '+this.above+'/'+this.props.acceptBars],['val',A.val,half(A.poc-A.val),holdL?this.props.sellColor:a.location===0?this.props.buyColor:this.props.neutralColor,holdL?'SELL?':a.location===0?'BUY?':'TEST '+this.below+'/'+this.props.acceptBars],['poc',A.poc,half(Math.min(A.vah-A.poc,A.poc-A.val)),this.props.reviewColor,'REVIEW']];
+            const rows=[['vah',A.vah,widths.high,holdH?this.props.buyColor:a.location===0?this.props.sellColor:this.props.neutralColor,holdH?'BUY?':a.location===0?'SELL?':'TEST '+this.above+'/'+this.props.acceptBars],['val',A.val,widths.low,holdL?this.props.sellColor:a.location===0?this.props.buyColor:this.props.neutralColor,holdL?'SELL?':a.location===0?'BUY?':'TEST '+this.below+'/'+this.props.acceptBars],['poc',A.poc,widths.poc,this.props.reviewColor,'REVIEW']];
             rows.forEach(r=>{if(r[0]==='poc' && (A.poc-A.val<3*this.tick || A.vah-A.poc<3*this.tick))return;items.push(rect('zone-'+r[0],du(index),du(r[1]-r[2]),du(this.props.areaExtension),du(r[2]*2),r[3],(100-this.props.areaTransparency)/100));items.push(text('zone-text-'+r[0],r[4]+' '+r[1].toFixed(2),du(index+this.props.areaExtension+1),du(r[1]),r[3]));});
         }
         if(this.props.showDashboard){
             const ready=p && p.good && p.levels;
+            const asOf=ny(a.b.t+this.duration);
             const prior=this.prior?this.prior.key+' · '+this.prior.observed+' observed / '+this.prior.absent+' absent':'Unavailable — load complete US history';
             const test=k=>this.tests[k]?'Tested':this.testsCovered?'Untested':'Unknown';
             const lines=['ASIA SESSION VOLUME PROFILE · '+(a.s.kind==='US'?'NY CASH':a.s.kind==='ON'?'OVERNIGHT':'OUTSIDE WATCH HOURS'),this.context,
                 'Profile: '+(ready?'Ready · closed '+this.minutes+'m bars':p?p.reason:'Waiting for session'),
-                'As of '+dateKey(ny(a.b.t+this.duration))+' '+String(ny(a.b.t+this.duration).minute/60|0).padStart(2,'0')+':'+String(ny(a.b.t+this.duration).minute%60).padStart(2,'0')+' NY',
+                'As of '+dateKey(asOf)+' '+String(asOf.minute/60|0).padStart(2,'0')+':'+String(asOf.minute%60).padStart(2,'0')+' NY',
                 ready?'VAH '+p.levels.vah.toFixed(2)+' · POC '+p.levels.poc.toFixed(2)+' · VAL '+p.levels.val.toFixed(2):'Current levels unavailable',
                 'Prior US: '+prior,
                 'VWAP: '+(a.vwap===null?'Anchor missing':a.vwap.toFixed(2)+' · '+(a.s.kind==='US' && this.props.cashVWAP?'Cash 09:30':'Futures 18:00')),
