@@ -2,7 +2,7 @@
 
 Native Tradovate custom indicator for standard **1-minute and 5-minute charts**.
 
-`AsiaSessionVolumeProfile.js` is the latest saved and published source, copied unchanged on 10 October 2026.
+`AsiaSessionVolumeProfile.js` is the indicator source maintained in this repository.
 
 ## Installation
 
@@ -26,4 +26,6 @@ Tradovate's standard right-side volume profile is configured separately in chart
 
 ## Updates
 
-This private repository stores the source and its change history. A GitHub push does not update the Tradovate community version. Publish accepted changes through Tradovate's existing community entry; other logins install from the link above and apply available community updates.
+This private repository is the working source for future updates. Every accepted indicator change must be validated, committed, pushed, and published to the existing unlisted Tradovate community entry, retaining the installation link above. See [AGENTS.md](AGENTS.md) for the standing release instructions.
+
+A GitHub push does not update Tradovate by itself. Other logins install from the link above and apply available community updates.
