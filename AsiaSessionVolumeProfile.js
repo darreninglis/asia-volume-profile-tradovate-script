@@ -61,6 +61,11 @@ function add(p,b,step,duration) {
     p.complete=ny(b.t+duration).minute===(p.kind==='US'?960:570);
 }
 function bar(d,index) {return {t:+new Date(d.timestamp()),h:d.high(),l:d.low(),c:d.close(),o:d.open(),v:d.volume(),index:d.index(),sequence:index,tradeDate:typeof d.tradeDate==='function'?d.tradeDate():undefined};}
+function sameHistoryBar(a,b) {
+    return Object.is(a.t,b.t) && Object.is(a.o,b.o) && Object.is(a.h,b.h) && Object.is(a.l,b.l)
+        && Object.is(a.c,b.c) && Object.is(a.v,b.v) && Object.is(a.index,b.index)
+        && String(a.tradeDate)===String(b.tradeDate);
+}
 function line(key,y,x1,x2,color,width) {return {tag:'LineSegments',key,lines:[{tag:'Line',a:{x:du(x1),y:du(y)},b:{x:du(x2),y:du(y)}}],lineStyle:{color,lineWidth:width||1}};}
 // rightMiddle positions text to the right of its anchor in the live renderer.
 function text(key,value,x,y,color,size) {return {tag:'Text',key,text:value,point:{x,y},style:{fontSize:size||12,fill:color},textAlignment:'rightMiddle'};}
@@ -70,6 +75,59 @@ function referenceCaption(name) {
         .replace(/New York/g,'NY').replace(/London/g,'LDN').replace(/Tokyo/g,'TKY')
         .replace(/Monday/g,'Mon').replace(/Daily/g,'Day').replace(/Weekly/g,'Week')
         .replace(/ \(trade close\)/g,' (close)');
+}
+// Display choices never enter the profile, VWAP, context or reference calculations.
+function displaySettings(props) {
+    const view=Object.assign({showPrior:true,visibleCompleted:props.completedProfiles},props);
+    const preset=props.displayPreset;
+    if(preset==='essential' || preset==='context' || preset==='full') {
+        const full=preset==='full',context=preset==='context';
+        ['showDaily','showWeekly','showMonthly','showQuarterly','showYearly','showMonday','showPivots','showLondon','showNewYorkRange','showTokyo','showSessionBoxes','showHistory'].forEach(key=>{view[key]=full;});
+        view.showHistograms=true;view.showLevels=true;view.showPrior=full || context;
+        view.showZones=full || context;view.showVWAP=full || context;
+        view.showFuturesComparison=full;view.showDeveloping=full && props.showDeveloping;
+        view.visibleCompleted=full?props.completedProfiles:1;
+    }
+    return view;
+}
+// All right-side captions share one lane. Only captions move; prices stay exact.
+function priceCaptions(captions,tick,close) {
+    const groups=[];
+    captions.forEach(caption=>{
+        const group=groups.find(item=>Math.abs(item.value-caption.value)<tick*.1);
+        if(group) {
+            if(!group.names.includes(caption.name))group.names.push(caption.name);
+            group.showPrice=group.showPrice || caption.showPrice;
+        } else groups.push(Object.assign({},caption,{names:[caption.name]}));
+    });
+    if(!groups.length)return null;
+    groups.sort((a,b)=>b.value-a.value);
+    let anchor=0;
+    groups.forEach((caption,i)=>{if(Math.abs(caption.value-close)<Math.abs(groups[anchor].value-close))anchor=i;});
+    groups[anchor].y=du(groups[anchor].value);
+    for(let i=anchor-1;i>=0;i--)groups[i].y=op(du(groups[i].value),'min',op(groups[i+1].y,'-',px(18)));
+    for(let i=anchor+1;i<groups.length;i++)groups[i].y=op(du(groups[i].value),'max',op(groups[i-1].y,'+',px(18)));
+    const children=[];
+    groups.forEach((caption,i)=>{
+        const names=caption.names.map(referenceCaption).join(' / ');
+        const label=(names.length>39?names.slice(0,36)+'...':names)+(caption.showPrice?'  '+caption.value.toFixed(2):'');
+        children.push({tag:'LineSegments',key:'price-leader-'+i,lines:[{tag:'Line',a:{x:px(-536),y:du(caption.value)},b:{x:px(-520),y:caption.y}}],lineStyle:{color:caption.color,lineWidth:1}});
+        children.push(rect('caption-background-'+i,px(-517),op(caption.y,'-',px(9)),px(label.length*6.6+8),px(18),'#17212b',.94));
+        children.push({tag:'Container',key:'caption-foreground-'+i,transformOps:[{tag:'ZIndex',zIndex:3}],children:[text('price-caption-'+i,label,px(-514),caption.y,caption.color,12)]});
+    });
+    // Keep the final 180px clear for Tradovate's separate native volume profile.
+    return {tag:'Container',key:'price-captions',global:true,origin:{cs:'grid',h:'right',v:'top'},transformOps:[{tag:'ZIndex',zIndex:1}],children};
+}
+function profileStatus(profile,minutes,prior,futuresAbsent) {
+    const parts=['Estimated OHLCV',minutes+'m'];
+    if(profile) {
+        parts.push(profile.kind==='ON'?'Overnight 18:00-09:30 NY':'US 09:30-16:00 NY');
+        if(!profile.good || !profile.levels)parts.push(profile.reason || 'Waiting for history');
+        else parts.push((profile.complete?'Complete':'Developing')+(profile.absent?' / Partial: '+profile.absent+'m absent':' / No gaps observed'));
+    } else parts.push('Outside profile hours');
+    if(prior && prior.absent)parts.push('Prior US partial: '+prior.absent+'m absent');
+    if(futuresAbsent)parts.push('Futures VWAP partial');
+    return parts.join(' | ');
 }
 // The live Tradovate renderer uses percent opacity (verified against 1 vs 50).
 // Keep callers in fractions and convert at the graphics boundary.
@@ -161,8 +219,8 @@ class ReferenceOverlays {
         }
         this.previousBar=b;
     }
-    draw(index) {
-        const props=this.props,items=[],levels=[];
+    draw(index,captions=[],props=this.props) {
+        const items=[],levels=[];
         if(props.showHistory) {
             [['val','wl',props.buyColor],['vah','wh',props.sellColor],['poc','wp',props.reviewColor]].forEach(def=>{
                 const primitives=this.zoneHistory.filter(s=>s[def[1]]>0).map(s=>({tag:'Rectangle',position:{x:du(s.x1),y:du(s[def[0]]-s[def[1]])},size:{width:du(s.x2-s.x1),height:du(s[def[1]]*2)}}));
@@ -212,46 +270,110 @@ class ReferenceOverlays {
             const x=props.rightAnchoredReferences?Math.max(l.start,index-props.referenceAnchorBars):l.start,end=index+props.referenceLabelBars;
             items.push(line('ref-line-'+i,l.value,x,end,l.color,props.referenceLineWidth));
         });
-        if(props.showReferenceLabels && groups.length) {
-            // Let the renderer resolve screen-space gaps on every zoom/pan.
-            // Spread both ways around the closest reference to avoid downward drift.
-            const captions=groups.map((l,i)=>Object.assign({id:i},l)).sort((a,b)=>b.value-a.value);
-            const close=this.previousBar?this.previousBar.c:captions[0].value;
-            let anchor=0;
-            captions.forEach((l,i)=>{if(Math.abs(l.value-close)<Math.abs(captions[anchor].value-close))anchor=i;});
-            captions[anchor].y=du(captions[anchor].value);
-            for(let i=anchor-1;i>=0;i--)captions[i].y=op(du(captions[i].value),'min',op(captions[i+1].y,'-',px(18)));
-            for(let i=anchor+1;i<captions.length;i++)captions[i].y=op(du(captions[i].value),'max',op(captions[i-1].y,'+',px(18)));
-            const children=[];
-            captions.forEach(l=>{
-                children.push({tag:'LineSegments',key:'ref-leader-'+l.id,lines:[{tag:'Line',a:{x:px(-466),y:du(l.value)},b:{x:px(-450),y:l.y}}],lineStyle:{color:l.color,lineWidth:1}});
-                children.push(text('ref-caption-'+l.id,referenceCaption(l.name)+(props.referencePrices?'  '+l.value.toFixed(2):''),px(-444),l.y,l.color,12));
-            });
-            // Leave the last 180 pixels available for the native day volume profile.
-            items.push({tag:'Container',key:'reference-captions',global:true,origin:{cs:'grid',h:'right',v:'top'},transformOps:[{tag:'ZIndex',zIndex:1}],children});
-        }
+        if(props.showReferenceLabels)groups.forEach(level=>captions.push(Object.assign({showPrice:props.referencePrices},level)));
         return items;
     }
 }
 
+// Unexposed reference/style defaults live here; public defaults come from params.
+const referenceDefaults={
+    dailyOpen:true,
+    dailyRange:true,
+    dailyMid:true,
+    weeklyOpen:true,
+    weeklyRange:true,
+    weeklyMid:true,
+    monthlyOpen:true,
+    monthlyRange:true,
+    monthlyMid:true,
+    quarterlyOpen:true,
+    quarterlyRange:true,
+    quarterlyMid:true,
+    yearlyOpen:true,
+    yearlyRange:true,
+    yearlyMid:true,
+    mondayMid:true,
+    rightAnchoredReferences:true,
+    mergeReferences:true,
+    showReferenceLabels:true,
+    referencePrices:true,
+    pivotP:true,
+    pivotR1:true,
+    pivotR2:true,
+    pivotR3:true,
+    pivotR4:true,
+    pivotR5:true,
+    pivotS1:true,
+    pivotS2:true,
+    pivotS3:true,
+    pivotS4:true,
+    pivotS5:true,
+    londonStart:120,
+    londonEnd:510,
+    newYorkStart:510,
+    newYorkEnd:1140,
+    tokyoStart:1020,
+    tokyoEnd:120,
+    referenceLineWidth:1,
+    referenceLabelBars:10,
+    referenceAnchorBars:250,
+    dailyColor:"#29b6f6",
+    weeklyColor:"#795500",
+    monthlyColor:"#006B45",
+    quarterlyColor:"#B3261E",
+    yearlyColor:"#8E245D",
+    mondayColor:"#455A64",
+    pivotColor:"#B85C00",
+    londonColor:"#AB47BC",
+    newYorkColor:"#26a69a",
+    tokyoColor:"#1976D2"
+};
+const settingBounds={
+    ticksPerRow:[1,1000],
+    valueAreaPercent:[1,100],
+    completedProfiles:[2,20],
+    rvolLookback:[5,100],
+    rvolMinSamples:[1,100],
+    historySessions:[0,20],
+    pocLookback:[1,240],
+    acceptBars:[2,60],
+    areaExtension:[1,300],
+    labelOffset:[1,200],
+    histogramWidth:[5,80],
+    referenceAnchorBars:[1,5000],
+    referenceLabelBars:[1,200],
+    referenceLineWidth:[0.5,5],
+    areaTransparency:[0,95],
+    maxPriorAgeDays:[1,365]
+};
+function normalizeSettings(supplied) {
+    const defaults=Object.assign({},referenceDefaults);
+    Object.keys(module.exports.params).forEach(key=>{defaults[key]=module.exports.params[key].def;});
+    const props=Object.assign({},defaults,supplied);
+    Object.keys(defaults).forEach(key=>{if(props[key]===undefined)props[key]=defaults[key];});
+    Object.keys(settingBounds).forEach(key=>{
+        const value=Number(props[key]),range=settingBounds[key];
+        props[key]=Math.max(range[0],Math.min(range[1],Number.isFinite(value)?value:defaults[key]));
+    });
+    ['ticksPerRow','completedProfiles','rvolLookback','rvolMinSamples','historySessions','pocLookback','acceptBars','maxPriorAgeDays'].forEach(key=>{props[key]=Math.floor(props[key]);});
+    props.rvolMinSamples=Math.min(props.rvolMinSamples,props.rvolLookback);
+    return props;
+}
+
 class AsiaSessionVolumeProfile {
     init() {
-        const defaults={};Object.keys(module.exports.params).forEach(key=>{defaults[key]=module.exports.params[key].def;});
-        this.props=Object.assign({},defaults,this.props);
-        Object.keys(defaults).forEach(key=>{if(this.props[key]===undefined)this.props[key]=defaults[key];});
-        const limits={ticksPerRow:[1,1000,8],valueAreaPercent:[1,100,70],completedProfiles:[2,20,6],rvolLookback:[5,100,20],rvolMinSamples:[1,100,5],historySessions:[0,20,5],pocLookback:[1,240,6],acceptBars:[2,60,2],areaExtension:[1,300,36],labelOffset:[1,200,25],histogramWidth:[5,80,30],referenceAnchorBars:[1,5000,250],referenceLabelBars:[1,200,10],referenceLineWidth:[.5,5,1],areaTransparency:[0,95,80],maxPriorAgeDays:[1,365,7]};
-        Object.keys(limits).forEach(key=>{const v=Number(this.props[key]),r=limits[key];this.props[key]=Math.max(r[0],Math.min(r[1],Number.isFinite(v)?v:r[2]));});
-        ['ticksPerRow','completedProfiles','rvolLookback','rvolMinSamples','historySessions','pocLookback','acceptBars','maxPriorAgeDays'].forEach(key=>{this.props[key]=Math.floor(this.props[key]);});
-        this.props.rvolMinSamples=Math.min(this.props.rvolMinSamples,this.props.rvolLookback);
+        this.props=normalizeSettings(this.props);
+        this.view=displaySettings(this.props);
+        this.histogramCache=new Map();
         this.minutes=Number(this.chartDescription && this.chartDescription.elementSize);
         this.duration=([1,5].includes(this.minutes)?this.minutes:1)*MIN;
         this.inputWarning=null;this.drawCache=null;
-        this.props=Object.assign({showDaily:true,dailyOpen:true,dailyRange:true,dailyMid:true,showWeekly:true,weeklyOpen:true,weeklyRange:true,weeklyMid:true,showMonthly:true,monthlyOpen:true,monthlyRange:true,monthlyMid:true,showQuarterly:true,quarterlyOpen:true,quarterlyRange:true,quarterlyMid:true,showYearly:true,yearlyOpen:true,yearlyRange:true,yearlyMid:true,showMonday:true,mondayMid:true,showPivots:true,showLondon:true,showNewYorkRange:true,showTokyo:true,showSessionBoxes:true,rightAnchoredReferences:true,mergeReferences:true,showReferenceLabels:true,referencePrices:true,showHistory:true,pivotP:true,pivotR1:true,pivotR2:true,pivotR3:true,pivotR4:true,pivotR5:true,pivotS1:true,pivotS2:true,pivotS3:true,pivotS4:true,pivotS5:true,londonStart:120,londonEnd:510,newYorkStart:510,newYorkEnd:1140,tokyoStart:1020,tokyoEnd:120,referenceLineWidth:1,referenceLabelBars:10,referenceAnchorBars:250,historySessions:5,settlementDate:0,settlementClose:0,dailyColor:'#29b6f6',weeklyColor:'#795500',monthlyColor:'#006B45',quarterlyColor:'#B3261E',yearlyColor:'#8E245D',mondayColor:'#455A64',pivotColor:'#B85C00',londonColor:'#AB47BC',newYorkColor:'#26a69a',tokyoColor:'#1976D2',pivotPeriod:'D',rangeTimezone:'America/Chicago'},this.props);this.tick=this.contractInfo.tickSize;this.step=this.tick*this.props.ticksPerRow;
-        this.active=null;this.completed=[];this.prior=null;this.lastValidUS=null;this.previous=null;this.processed=-1;this.historyStart=null;
+        this.tick=this.contractInfo.tickSize;this.step=this.tick*this.props.ticksPerRow;
+        this.active=null;this.completed=[];this.prior=null;this.lastValidUS=null;this.previous=null;this.processed=-1;this.historyStart=null;this.historyBars={items:[],liveIndex:null};
         this.future=null;this.fpv=0;this.fvol=0;this.fgood=false;this.fAbsent=0;
         this.above=0;this.below=0;this.context='Waiting for closed-bar context';this.area=null;
         this.tests={vah:false,poc:false,val:false};this.testsCovered=false;
-        this.baselines={US:[],ON:[]};this.pocHistory=[];this.events=[];this.atr=null;this.trCount=0;this.trSum=0;
+        this.baselines={US:[],ON:[]};this.pocHistory=[];this.atr=null;this.trCount=0;this.trSum=0;
         this.snapshot={};this.references=new ReferenceOverlays(this.props,this.tick,this.duration);
     }
     supported() {const d=this.chartDescription;return !!d && d.underlyingType==='MinuteBar' && [1,5].includes(Number(d.elementSize)) && d.elementSizeUnit==='UnderlyingUnits';}
@@ -269,6 +391,7 @@ class AsiaSessionVolumeProfile {
     commit(b) {
         const sequence=b.sequence===undefined?b.index:b.sequence;
         if(sequence<=this.processed)return;
+        this.historyBars.items[sequence]=b;
         this.processed=sequence;this.drawCache=null;
         const valid=[b.t,b.o,b.h,b.l,b.c,b.v,b.index,sequence].every(Number.isFinite) && b.h>=b.l && b.o>=b.l && b.o<=b.h && b.c>=b.l && b.c<=b.h && b.v>=0;
         if(!valid || b.t%this.duration!==0 || (this.previous && b.t<=this.previous.t)) {
@@ -325,6 +448,7 @@ class AsiaSessionVolumeProfile {
         this.previous=b;
     }
     map(d,index,history) {
+        const last=d.isLast();
         // Tradovate can keep a calculator while changing its chart interval or
         // replacing/prepending history. Replay supplied closed bars after a change;
         // calculation formulas and duplicate protection remain unchanged.
@@ -344,28 +468,41 @@ class AsiaSessionVolumeProfile {
                     if(Number.isFinite(size) && size>=0 && sequence>=size)reset=true;
                 }
             }
+            // Revisited closed inputs can carry corrected OHLCV or trading dates.
+            // Replay instead of adjusting totals: all derived state depends on them.
+            const saved=this.historyBars.items[index];
+            if(!reset && !last && saved && !sameHistoryBar(saved,bar(d,index)))reset=true;
+            // A history-only correction may arrive without a callback for that bar.
+            // Audit once per new live candle, never on its repeated price updates.
+            if(!reset && last && this.historyBars.liveIndex!==null && this.historyBars.liveIndex!==index && history && typeof history.get==='function') {
+                for(let i=0;i<=Math.min(this.processed,index-1);i++) {
+                    const source=history.get(i),prior=this.historyBars.items[i];
+                    if(!source || !prior || !sameHistoryBar(prior,bar(source,i))){reset=true;break;}
+                }
+            }
             if(reset)this.init();
             if(Number.isFinite(start))this.historyStart=start;
         }
         if(!this.supported())return d.isLast()?{graphics:{items:this.warning('Use a standard 1- or 5-minute chart')}}:{};
         // Repeated live updates never accumulate the current candle twice.
-        const lastClosed=d.isLast()?index-1:index;
+        const lastClosed=last?index-1:index;
         for(let i=this.processed+1;i<=lastClosed;i++) {
             const source=i===index?d:history && history.get(i);
             if(!source){this.inputWarning='Closed-bar history unavailable';this.drawCache=null;break;}
             this.commit(bar(source,i));
         }
+        if(last)this.historyBars.liveIndex=index;
         const a=this.snapshot, out={};
         if(this.inputWarning)return Object.assign({dataReady:0,contextState:0},d.isLast()?{graphics:{items:this.warning(this.inputWarning)}}:{});
-        if(!a.b)return out;
+        if(!a.b)return d.isLast()?{graphics:{items:this.warning('Waiting for the first closed bar')}}:out;
         out.contextState=a.area?(this.above>=this.props.acceptBars?3:this.below>=this.props.acceptBars?-3:a.location):0;
         out.dataReady=this.active && this.active.good && this.active.levels && a.area && a.vwap!==null?1:0;
         if(this.active && this.active.levels){out.currentVAH=this.active.levels.vah;out.currentPOC=this.active.levels.poc;out.currentVAL=this.active.levels.val;}
         if(this.prior){out.priorVAH=this.prior.levels.vah;out.priorPOC=this.prior.levels.poc;out.priorVAL=this.prior.levels.val;}
         if(a.rvol!==null)out.sessionRVOL=a.rvol;
-        if(this.props.showVWAP && a.vwap!==null)out.vwap=a.vwap;
-        if(this.props.showFuturesComparison && a.futures!==null && (!a.s.kind || (a.s.kind==='US' && this.props.cashVWAP)))out.futuresVWAP=a.futures;
-        if(this.props.showDeveloping && this.active && this.active.levels){out.devVAH=this.active.levels.vah;out.devPOC=this.active.levels.poc;out.devVAL=this.active.levels.val;}
+        if(this.view.showVWAP && a.vwap!==null)out.vwap=a.vwap;
+        if(this.view.showFuturesComparison && a.futures!==null && (!a.s.kind || (a.s.kind==='US' && this.props.cashVWAP)))out.futuresVWAP=a.futures;
+        if(this.view.showDeveloping && this.active && this.active.levels){out.devVAH=this.active.levels.vah;out.devPOC=this.active.levels.poc;out.devVAL=this.active.levels.val;}
         if(d.isLast()) {
             const key=this.processed+':'+d.index()+':'+(this.inputWarning||'');
             if(!this.drawCache || this.drawCache.key!==key)this.drawCache={key,items:this.draw(d.index()).map(item=>Object.assign({global:true},item))};
@@ -373,49 +510,66 @@ class AsiaSessionVolumeProfile {
         }
         return out;
     }
-    warning(message) {return [{tag:'Container',key:'asia-warning',global:true,transformOps:[{tag:'ZIndex',zIndex:1}],origin:{cs:'grid',h:'left',v:'top'},children:[rect('warning-bg',px(10),px(12),px(510),px(29),'#241b12',.94),text('warning-text','Asia profile: '+message,px(18),px(27),'#ffcf80',12)]}];}
+    warning(message) {
+        const status=profileStatus(this.active,this.minutes,this.prior,this.fAbsent);
+        const value=status.includes(message)?status:status+' | '+message;
+        return [{tag:'Container',key:'profile-status',global:true,transformOps:[{tag:'ZIndex',zIndex:1}],origin:{cs:'grid',h:'left',v:'top'},children:[rect('warning-bg',px(12),px(10),px(value.length*6.2+18),px(25),'#241b12',.94),{tag:'Container',key:'profile-status-foreground',transformOps:[{tag:'ZIndex',zIndex:3}],children:[text('profile-status-text',value,px(21),px(23),'#ffcf80',11)]}]}];
+    }
     draw(index) {
-        const items=this.references.draw(index),a=this.snapshot,p=this.active;
-        if(this.inputWarning || (p && (!p.good || !p.levels)))items.push(...this.warning(this.inputWarning || p.reason || 'Waiting for volume'));
-        const profiles=this.completed.slice();if(p && p.good && p.levels)profiles.push(p);
+        const captions=[],view=this.view,a=this.snapshot,p=this.active;
+        const items=this.references.draw(index,captions,view);
+        const retained=new Set(this.completed);
+        if(p)retained.add(p);
+        this.histogramCache.forEach((value,profile)=>{if(!retained.has(profile))this.histogramCache.delete(profile);});
+        const profiles=this.completed.slice(-view.visibleCompleted);if(p && p.good && p.levels)profiles.push(p);
         profiles.forEach((q,n)=>{
             const color=q.kind==='US'?this.props.usColor:this.props.overnightColor,L=q.levels,k='profile-'+n;
             const span=Math.max(1,q.endIndex-q.startIndex+1)*this.props.histogramWidth/100;
-            if(this.props.showHistograms) {
-                const outside=[],inside=[];
-                q.rows.forEach((v,j)=>{const r={tag:'Rectangle',position:{x:du(q.startIndex),y:du((q.first+j)*this.step)},size:{width:du(span*v/q.rows[L.peak]),height:du(this.step)}};(j>=L.lo && j<=L.hi?inside:outside).push(r);});
-                items.push({tag:'Shapes',key:k+'out',primitives:outside,fillStyle:fill(color,q.kind==='ON'?.20:.16)},{tag:'Shapes',key:k+'in',primitives:inside,fillStyle:fill(color,q.kind==='ON'?.58:.43)});
+            if(view.showHistograms) {
+                let geometry=q===p?null:this.histogramCache.get(q);
+                if(!geometry) {
+                    geometry={outside:[],inside:[]};
+                    q.rows.forEach((v,j)=>{const r={tag:'Rectangle',position:{x:du(q.startIndex),y:du((q.first+j)*this.step)},size:{width:du(span*v/q.rows[L.peak]),height:du(this.step)}};(j>=L.lo && j<=L.hi?geometry.inside:geometry.outside).push(r);});
+                    if(q!==p)this.histogramCache.set(q,geometry);
+                }
+                items.push({tag:'Shapes',key:k+'out',primitives:geometry.outside,fillStyle:fill(color,q.kind==='ON'?.20:.16)},{tag:'Shapes',key:k+'in',primitives:geometry.inside,fillStyle:fill(color,q.kind==='ON'?.58:.43)});
             }
             let end=q.endIndex+1;
             if(q.kind==='ON' && q.complete && this.props.extendOvernight && a.s.kind==='US' && dateKey(ny(q.last))===dateKey(ny(a.b.t)))end=index+this.props.labelOffset;
-            if(this.props.showLevels)['vah','poc','val'].forEach(t=>{items.push(line(k+t,L[t],q.startIndex,end,color,t==='poc'?(q.kind==='ON'?3:2):1));});
-            if(this.props.showHistograms)items.push(text(k+'caption',q.kind==='ON'?'ASIA / OVERNIGHT':'US',du(q.startIndex),op(du(L.vah),'-',px(18)),color,q.kind==='ON'?13:11));
+            if(view.showLevels)['vah','poc','val'].forEach(t=>{items.push(line(k+t,L[t],q.startIndex,end,color,t==='poc'?(q.kind==='ON'?3:2):1));});
+            if(view.showHistograms)items.push(text(k+'caption',q.kind==='ON'?'OVERNIGHT / 18:00-09:30 NY':'US / 09:30-16:00 NY',du(q.startIndex),op(du(L.vah),'-',px(18)),color,q.kind==='ON'?13:11));
+            if(view.showLevels && q===profiles[profiles.length-1])['vah','poc','val'].forEach(level=>captions.push({name:(q.kind==='ON'?'ON ':'US ')+level.toUpperCase(),value:L[level],color,showPrice:true}));
         });
-        if(this.prior && a.s.kind==='ON') ['vah','poc','val'].forEach(k=>{
-            const y=this.prior.levels[k],name=k==='poc'?'PPOC':k==='vah'?'PVAH':'PVAL';
+        if(view.showPrior && this.prior && a.s.kind==='ON') ['vah','poc','val'].forEach(k=>{
+            const y=this.prior.levels[k],name='Prior '+k.toUpperCase();
             items.push(line('prior-'+k,y,p?p.startIndex:index,index+this.props.labelOffset,this.props.priorColor,k==='poc'?2:1));
-            items.push(text('prior-label-'+k,name+' '+y.toFixed(2),du(index+this.props.labelOffset),du(y),this.props.priorColor));
+            captions.push({name,value:y,color:this.props.priorColor,showPrice:true});
         });
         const A=a.area;
-        if(this.props.showZones && A && A.vah-A.val>=3*this.tick) {
+        if(view.showZones && A && A.vah-A.val>=3*this.tick) {
             const widths=zoneWidths(this.props,this.tick,A,a.priorAtr);
             const holdH=this.above>=this.props.acceptBars,holdL=this.below>=this.props.acceptBars;
-            const rows=[['vah',A.vah,widths.high,holdH?this.props.buyColor:a.location===0?this.props.sellColor:this.props.neutralColor,holdH?'BUY?':a.location===0?'SELL?':'TEST '+this.above+'/'+this.props.acceptBars],['val',A.val,widths.low,holdL?this.props.sellColor:a.location===0?this.props.buyColor:this.props.neutralColor,holdL?'SELL?':a.location===0?'BUY?':'TEST '+this.below+'/'+this.props.acceptBars],['poc',A.poc,widths.poc,this.props.reviewColor,'REVIEW']];
-            rows.forEach(r=>{if(r[0]==='poc' && (A.poc-A.val<3*this.tick || A.vah-A.poc<3*this.tick))return;items.push(rect('zone-'+r[0],du(index),du(r[1]-r[2]),du(this.props.areaExtension),du(r[2]*2),r[3],(100-this.props.areaTransparency)/100));items.push(text('zone-text-'+r[0],r[4]+' '+r[1].toFixed(2),du(index+this.props.areaExtension+1),du(r[1]),r[3]));});
+            const rows=[['vah',A.vah,widths.high,holdH?this.props.buyColor:a.location===0?this.props.sellColor:this.props.neutralColor,holdH?'Holding above':a.location===0?'Upper value edge':'Testing above '+this.above+'/'+this.props.acceptBars],['val',A.val,widths.low,holdL?this.props.sellColor:a.location===0?this.props.buyColor:this.props.neutralColor,holdL?'Holding below':a.location===0?'Lower value edge':'Testing below '+this.below+'/'+this.props.acceptBars],['poc',A.poc,widths.poc,this.props.reviewColor,'Review']];
+            rows.forEach(r=>{if(r[0]==='poc' && (A.poc-A.val<3*this.tick || A.vah-A.poc<3*this.tick))return;items.push(rect('zone-'+r[0],du(index),du(r[1]-r[2]),du(this.props.areaExtension),du(r[2]*2),r[3],(100-this.props.areaTransparency)/100));captions.push({name:r[4],value:r[1],color:r[3],showPrice:true});});
         }
+        const captionLayer=priceCaptions(captions,this.tick,a.b.c);
+        if(captionLayer)items.push(captionLayer);
+        const status=profileStatus(p,this.minutes,this.prior,this.fAbsent);
+        const statusColor=p && (!p.good || p.absent) || this.prior && this.prior.absent || this.fAbsent?'#ffc66d':'#d6e2e8';
+        items.push({tag:'Container',key:'profile-status',global:true,origin:{cs:'grid',h:'left',v:'top'},transformOps:[{tag:'ZIndex',zIndex:1}],children:[rect('profile-status-background',px(12),px(10),px(status.length*6.2+18),px(25),'#17212b',.94),{tag:'Container',key:'profile-status-foreground',transformOps:[{tag:'ZIndex',zIndex:3}],children:[text('profile-status-text',status,px(21),px(23),statusColor,11)]}]});
         if(this.props.showDashboard){
             const ready=p && p.good && p.levels;
             const asOf=ny(a.b.t+this.duration);
             const prior=this.prior?this.prior.key+' · '+this.prior.observed+' observed / '+this.prior.absent+' absent':'Unavailable — load complete US history';
             const test=k=>this.tests[k]?'Tested':this.testsCovered?'Untested':'Unknown';
             const lines=['ASIA SESSION VOLUME PROFILE · '+(a.s.kind==='US'?'NY CASH':a.s.kind==='ON'?'OVERNIGHT':'OUTSIDE WATCH HOURS'),this.context,
-                'Profile: '+(ready?'Ready · closed '+this.minutes+'m bars':p?p.reason:'Waiting for session'),
+                'Profile: '+(ready?(p.absent?'Partial coverage':'Ready')+' · closed '+this.minutes+'m bars':p?p.reason:'Waiting for session'),
                 'As of '+dateKey(asOf)+' '+String(asOf.minute/60|0).padStart(2,'0')+':'+String(asOf.minute%60).padStart(2,'0')+' NY',
                 ready?'VAH '+p.levels.vah.toFixed(2)+' · POC '+p.levels.poc.toFixed(2)+' · VAL '+p.levels.val.toFixed(2):'Current levels unavailable',
                 'Prior US: '+prior,
                 'VWAP: '+(a.vwap===null?'Anchor missing':a.vwap.toFixed(2)+' · '+(a.s.kind==='US' && this.props.cashVWAP?'Cash 09:30':'Futures 18:00')),
                 a.migration+' · '+a.valueRelation,
-                'RVOL: '+(a.rvol===null?'Warming up '+a.samples+'/'+this.props.rvolMinSamples+' full sessions':a.rvol.toFixed(2)+'× · '+a.samples+' sessions'),
+                'RVOL: '+(a.rvol===null?(p && p.absent?'Unavailable · sparse current session':'Warming up '+a.samples+'/'+this.props.rvolMinSamples+' full sessions'):a.rvol.toFixed(2)+'× · '+a.samples+' sessions'),
                 'PVAH '+test('vah')+' · PPOC '+test('poc')+' · PVAL '+test('val'),
                 this.minutes+'m OHLCV approximation'+(this.minutes===5?' (coarser)':'')+' · '+this.props.ticksPerRow+' ticks/row · '+this.props.valueAreaPercent+'% VA',
                 'Review areas only · no order signals'];
@@ -430,6 +584,66 @@ class AsiaSessionVolumeProfile {
     }
 }
 module.exports={name:'AsiaSessionVolumeProfile',description:'Asia session Volume Profile — closed 1m / 5m',calculator:AsiaSessionVolumeProfile,inputType:'bars',areaChoice:'overlay',tags:['Custom','Volume-based'],
-    params:{settlementDate:predef.paramSpecs.number(0,1,0),settlementClose:predef.paramSpecs.number(0,.25,0),pivotPeriod:predef.paramSpecs.enum({D:'Daily',W:'Weekly',M:'Monthly'},'D'),rangeTimezone:predef.paramSpecs.enum({'America/Chicago':'Chicago (exchange)','America/New_York':'New York','Europe/London':'London','Asia/Tokyo':'Tokyo',UTC:'UTC','Australia/Melbourne':'Melbourne'},'America/Chicago'),showDaily:predef.paramSpecs.bool(true),showWeekly:predef.paramSpecs.bool(true),showMonthly:predef.paramSpecs.bool(true),showQuarterly:predef.paramSpecs.bool(true),showYearly:predef.paramSpecs.bool(true),showMonday:predef.paramSpecs.bool(true),showPivots:predef.paramSpecs.bool(true),showLondon:predef.paramSpecs.bool(true),showNewYorkRange:predef.paramSpecs.bool(true),showTokyo:predef.paramSpecs.bool(true),showSessionBoxes:predef.paramSpecs.bool(true),showHistory:predef.paramSpecs.bool(true),historySessions:predef.paramSpecs.number(5,1,0),ticksPerRow:predef.paramSpecs.period(8),valueAreaPercent:predef.paramSpecs.percent(70,1,1,100),completedProfiles:predef.paramSpecs.number(6,1,2),histogramWidth:predef.paramSpecs.percent(30,1,5,80),showHistograms:predef.paramSpecs.bool(true),showLevels:predef.paramSpecs.bool(true),extendOvernight:predef.paramSpecs.bool(true),showDeveloping:predef.paramSpecs.bool(false),showVWAP:predef.paramSpecs.bool(true),cashVWAP:predef.paramSpecs.bool(true),showFuturesComparison:predef.paramSpecs.bool(true),showDashboard:predef.paramSpecs.bool(false),panelOnRight:predef.paramSpecs.bool(true),panelAtBottom:predef.paramSpecs.bool(false),reviewMode:predef.paramSpecs.bool(false),showZones:predef.paramSpecs.bool(true),zoneWidth:predef.paramSpecs.number(10,.5,.5),adaptiveWidth:predef.paramSpecs.bool(false),atrFactor:predef.paramSpecs.number(.5,.1,.1),minWidth:predef.paramSpecs.number(4,.5,.5),maxWidth:predef.paramSpecs.number(16,.5,.5),areaExtension:predef.paramSpecs.number(36,1,12),areaTransparency:predef.paramSpecs.percent(80,1,0,95),labelOffset:predef.paramSpecs.number(25,1,1),acceptBars:predef.paramSpecs.number(2,1,2),pocLookback:predef.paramSpecs.period(6),pocMinMove:predef.paramSpecs.number(.25,.25,.25),rvolLookback:predef.paramSpecs.number(20,1,5),rvolMinSamples:predef.paramSpecs.number(5,1,5),useLastFullUS:predef.paramSpecs.bool(false),maxPriorAgeDays:predef.paramSpecs.period(7),usColor:predef.paramSpecs.color('#687187'),overnightColor:predef.paramSpecs.color('#54c48c'),priorColor:predef.paramSpecs.color('#abb7c7'),buyColor:predef.paramSpecs.color('#66bb6a'),sellColor:predef.paramSpecs.color('#ef8a80'),reviewColor:predef.paramSpecs.color('#8b8ba7'),neutralColor:predef.paramSpecs.color('#9598a1'),panelBackground:predef.paramSpecs.color('#ecf0f1'),panelText:predef.paramSpecs.color('#01040d')},
+    params:{
+        settlementDate:predef.paramSpecs.number(0,1,0),
+        settlementClose:predef.paramSpecs.number(0,.25,0),
+        pivotPeriod:predef.paramSpecs.enum({D:'Daily',W:'Weekly',M:'Monthly'},'D'),
+        rangeTimezone:predef.paramSpecs.enum({'America/Chicago':'Chicago (exchange)','America/New_York':'New York','Europe/London':'London','Asia/Tokyo':'Tokyo',UTC:'UTC','Australia/Melbourne':'Melbourne'},'America/Chicago'),
+        showDaily:predef.paramSpecs.bool(true),
+        showWeekly:predef.paramSpecs.bool(true),
+        showMonthly:predef.paramSpecs.bool(true),
+        showQuarterly:predef.paramSpecs.bool(true),
+        showYearly:predef.paramSpecs.bool(true),
+        showMonday:predef.paramSpecs.bool(true),
+        showPivots:predef.paramSpecs.bool(true),
+        showLondon:predef.paramSpecs.bool(true),
+        showNewYorkRange:predef.paramSpecs.bool(true),
+        showTokyo:predef.paramSpecs.bool(true),
+        showSessionBoxes:predef.paramSpecs.bool(true),
+        showHistory:predef.paramSpecs.bool(true),
+        historySessions:predef.paramSpecs.number(5,1,0),
+        ticksPerRow:predef.paramSpecs.period(8),
+        valueAreaPercent:predef.paramSpecs.percent(70,1,1,100),
+        completedProfiles:predef.paramSpecs.number(6,1,2),
+        histogramWidth:predef.paramSpecs.percent(30,1,5,80),
+        showHistograms:predef.paramSpecs.bool(true),
+        showLevels:predef.paramSpecs.bool(true),
+        extendOvernight:predef.paramSpecs.bool(true),
+        showDeveloping:predef.paramSpecs.bool(false),
+        showVWAP:predef.paramSpecs.bool(true),
+        cashVWAP:predef.paramSpecs.bool(true),
+        showFuturesComparison:predef.paramSpecs.bool(true),
+        showDashboard:predef.paramSpecs.bool(false),
+        panelOnRight:predef.paramSpecs.bool(true),
+        panelAtBottom:predef.paramSpecs.bool(false),
+        reviewMode:predef.paramSpecs.bool(false),
+        showZones:predef.paramSpecs.bool(true),
+        zoneWidth:predef.paramSpecs.number(10,.5,.5),
+        adaptiveWidth:predef.paramSpecs.bool(false),
+        atrFactor:predef.paramSpecs.number(.5,.1,.1),
+        minWidth:predef.paramSpecs.number(4,.5,.5),
+        maxWidth:predef.paramSpecs.number(16,.5,.5),
+        areaExtension:predef.paramSpecs.number(36,1,12),
+        areaTransparency:predef.paramSpecs.percent(80,1,0,95),
+        labelOffset:predef.paramSpecs.number(25,1,1),
+        acceptBars:predef.paramSpecs.number(2,1,2),
+        pocLookback:predef.paramSpecs.period(6),
+        pocMinMove:predef.paramSpecs.number(.25,.25,.25),
+        rvolLookback:predef.paramSpecs.number(20,1,5),
+        rvolMinSamples:predef.paramSpecs.number(5,1,5),
+        useLastFullUS:predef.paramSpecs.bool(false),
+        maxPriorAgeDays:predef.paramSpecs.period(7),
+        usColor:predef.paramSpecs.color('#687187'),
+        overnightColor:predef.paramSpecs.color('#54c48c'),
+        priorColor:predef.paramSpecs.color('#abb7c7'),
+        buyColor:predef.paramSpecs.color('#66bb6a'),
+        sellColor:predef.paramSpecs.color('#ef8a80'),
+        reviewColor:predef.paramSpecs.color('#8b8ba7'),
+        neutralColor:predef.paramSpecs.color('#9598a1'),
+        panelBackground:predef.paramSpecs.color('#ecf0f1'),
+        panelText:predef.paramSpecs.color('#01040d'),
+        // Append new parameters: Tradovate also stores positional expressions.
+        displayPreset:predef.paramSpecs.enum({custom:'Custom (existing settings)',essential:'Essential',context:'Session Context',full:'Full References'},'custom')
+    },
     plots:{contextState:{title:'Context: -3 holding below, 0 inside, +3 holding above'},dataReady:{title:'Context data ready'},currentVAH:{title:'Current VAH'},currentPOC:{title:'Current POC'},currentVAL:{title:'Current VAL'},priorVAH:{title:'Prior US VAH'},priorPOC:{title:'Prior US POC'},priorVAL:{title:'Prior US VAL'},sessionRVOL:{title:'Session RVOL'},vwap:{title:'Active session VWAP'},futuresVWAP:{title:'Futures VWAP 18:00 NY'},devVAH:{title:'Developing VAH'},devPOC:{title:'Developing POC'},devVAL:{title:'Developing VAL'}},
     plotter:predef.plotters.multiline(['vwap','futuresVWAP','devVAH','devPOC','devVAL']),schemeStyles:{dark:{vwap:predef.styles.plot({color:'#003fba',lineWidth:2}),futuresVWAP:predef.styles.plot({color:'#8b8ba7',lineWidth:1}),devVAH:predef.styles.plot('#1b5e20'),devPOC:predef.styles.plot('#1b5e20'),devVAL:predef.styles.plot('#1b5e20')},light:{vwap:predef.styles.plot({color:'#003fba',lineWidth:2}),futuresVWAP:predef.styles.plot('#8b8ba7')}}};

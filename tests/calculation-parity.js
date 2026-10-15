@@ -52,14 +52,24 @@ function input(start, days, interval, negative = false, sparse = false) {
     return result;
 }
 function entity(b, last) {return {timestamp: () => new Date(b.t), index: () => b.index, open: () => b.o, high: () => b.h, low: () => b.l, close: () => b.c, volume: () => b.v, isLast: () => !!last};}
-function run(calc, bars, catchup) {
+function run(calc, bars, catchup, captureValues = false) {
     const history = {get: i => bars[i] ? entity(bars[i], i === bars.length - 1) : undefined, size: () => bars.length};
-    const hash = crypto.createHash('sha256'); let last, rvolOutputs = 0;
+    const hash = crypto.createHash('sha256'), stateHash = crypto.createHash('sha256');
+    const series = captureValues ? [] : undefined;
+    let last, previousSession, rvolOutputs = 0;
     const indices = catchup ? [bars.length - 1] : bars.map((_, i) => i);
     for (const i of indices) {
         last = calc.map(entity(bars[i], i === bars.length - 1), i, history);
         if (Number.isFinite(last.sessionRVOL)) rvolOutputs++;
-        const {graphics, ...values} = last; hash.update(JSON.stringify(values) + '\n');
+        hash.update(numericOutput(last) + '\n');
+        if (series) series.push(JSON.parse(numericOutput(last)));
+        // Full state snapshots at session transitions and regular checkpoints
+        // protect intermediate financial/reference state as well as final state.
+        // The stride keeps long-history verification practical without hashing
+        // all retained session-volume arrays after every single candle.
+        const currentSession = calc.active && calc.active.key;
+        if (currentSession !== previousSession || i % 257 === 0 || i === bars.length - 1) stateHash.update(financialState(calc) + '\n');
+        previousSession = currentSession;
     }
     const cache = last.graphics && last.graphics.items;
     const total = calc.active && calc.active.total;
@@ -69,7 +79,11 @@ function run(calc, bars, catchup) {
         assert.strictEqual(repeated.graphics.items, cache, 'Repeated live updates must reuse drawing objects');
         assert.equal(calc.active && calc.active.total, total, 'Repeated current bars must not accumulate');
     }
-    return {hash: hash.digest('hex'), output: JSON.stringify(last), state: financialState(calc), rvolOutputs};
+    return {hash: hash.digest('hex'), stateHash: stateHash.digest('hex'), values: numericOutput(last), output: JSON.stringify(last), state: financialState(calc), rvolOutputs, series};
+}
+function numericOutput(output) {
+    const {graphics, ...values} = output;
+    return JSON.stringify(values);
 }
 function financialState(calc) {
     const keys = ['minutes', 'duration', 'tick', 'step', 'active', 'completed', 'prior', 'lastValidUS', 'previous', 'processed', 'future', 'fpv', 'fvol', 'fgood', 'fAbsent', 'above', 'below', 'context', 'area', 'tests', 'testsCovered', 'baselines', 'pocHistory', 'atr', 'trCount', 'trSum', 'snapshot', 'inputWarning'];
@@ -92,6 +106,22 @@ test('NY calendar optimization preserves DST edges and agrees with independent I
         }
     }
 });
+test('Consolidated settings preserve previous defaults and numeric bounds', () => {
+    const previousKeys = Object.keys(baselineModule.params), currentKeys = Object.keys(candidateModule.params);
+    assert.deepStrictEqual(currentKeys.slice(0, previousKeys.length), previousKeys, 'Existing parameter positions must remain compatible with saved Tradovate expressions');
+    for (const [key, spec] of Object.entries(baselineModule.params)) {
+        assert.deepStrictEqual(candidateModule.params[key].def, spec.def, `${key}: public default changed`);
+    }
+    const bounded = ['ticksPerRow', 'valueAreaPercent', 'completedProfiles', 'rvolLookback', 'rvolMinSamples', 'historySessions', 'pocLookback', 'acceptBars', 'areaExtension', 'labelOffset', 'histogramWidth', 'referenceAnchorBars', 'referenceLabelBars', 'referenceLineWidth', 'areaTransparency', 'maxPriorAgeDays'];
+    const cases = [{}, Object.fromEntries(Object.keys(baselineModule.params).map(key => [key, undefined]))];
+    for (const value of [NaN, Infinity, -Infinity, 'invalid', null, -100, 3.75, 100000]) cases.push(Object.fromEntries(bounded.map(key => [key, value])));
+    for (const overrides of cases) {
+        const before = make(baselineModule, 1, overrides), after = make(candidateModule, 1, overrides);
+        for (const [key, value] of Object.entries(before.props)) assert.deepStrictEqual(after.props[key], value, `${key}: normalized setting differs`);
+        assert.equal(after.tick, before.tick);
+        assert.equal(after.step, before.step);
+    }
+});
 const scenarios = [
     {name: 'multiple RVOL/retention sessions', start: '2026-10-04T22:00:00Z', days: 24},
     {name: 'spring DST and sparse history', start: '2026-03-01T23:00:00Z', days: 12, sparse: true},
@@ -101,10 +131,14 @@ const scenarios = [
 for (const interval of [1, 5]) for (const scenario of scenarios) {
     const bars = input(scenario.start, scenario.days, interval, scenario.negative, scenario.sparse);
     const overrides = {rvolLookback: 5, rvolMinSamples: 5, completedProfiles: 2, historySessions: 3, showDashboard: true, showDeveloping: true, adaptiveWidth: true, useLastFullUS: true, rangeTimezone: scenario.negative ? 'Asia/Tokyo' : scenario.sparse ? 'Europe/London' : 'America/Chicago'};
-    test(`${interval}m ${scenario.name} exact sequential outputs/state/graphics`, () => {
+    test(`${interval}m ${scenario.name} exact sequential numeric outputs and financial/reference state`, () => {
         const before = run(make(baselineModule, interval, overrides), bars, false), after = run(make(candidateModule, interval, overrides), bars, false);
         assert.equal(after.hash, before.hash, 'Per-bar numeric output differs');
-        assert.equal(after.output, before.output, 'Last-bar output/graphics differs');
+        // Presentation changes are intentional. Compare all exported numeric
+        // values with the old release; compare graphics against a fresh run of
+        // the candidate below so replay/reset equivalence remains enforced.
+        assert.equal(after.values, before.values, 'Last-bar numeric output differs');
+        assert.equal(after.stateHash, before.stateHash, 'Intermediate financial/reference state differs');
         assert.equal(after.state, before.state, 'Financial/reference state differs');
         if (scenario.name === 'multiple RVOL/retention sessions') assert.ok(after.rvolOutputs > 0, 'Scenario must exercise warmed-up RVOL calculations');
         barsChecked += bars.length;
@@ -115,13 +149,33 @@ for (const interval of [1, 5]) for (const scenario of scenarios) {
         assert.equal(caught.state, sequential.state, 'Catch-up financial/reference state differs');
     });
 }
+for (const interval of [1, 5]) test(`${interval}m display presets preserve every calculation and retained reference history`, () => {
+    assert.equal(candidateModule.params.displayPreset.def, 'custom', 'Existing settings must remain the default');
+    const bars = input('2026-10-04T22:00:00Z', 8, interval);
+    const overrides = {rvolLookback: 5, rvolMinSamples: 5, showDeveloping: true, showVWAP: true, showFuturesComparison: true, showHistory: true};
+    const before = run(make(candidateModule, interval, {...overrides, displayPreset: 'custom'}), bars, false, true);
+    const optionalPlots = new Set(['vwap', 'futuresVWAP', 'devVAH', 'devPOC', 'devVAL']);
+    const core = values => Object.fromEntries(Object.entries(values).filter(([key]) => !optionalPlots.has(key)));
+    for (const preset of ['essential', 'context', 'full']) {
+        const after = run(make(candidateModule, interval, {...overrides, displayPreset: preset}), bars, false, true);
+        assert.equal(after.stateHash, before.stateHash, `${preset}: intermediate financial/reference state differs`);
+        assert.equal(after.state, before.state, `${preset}: final financial/reference state differs`);
+        assert.equal(after.series.length, before.series.length);
+        after.series.forEach((values, i) => {
+            assert.deepStrictEqual(core(values), core(before.series[i]), `${preset}: core numeric output differs at bar ${i}`);
+            for (const key of optionalPlots) if (Object.hasOwn(values, key)) {
+                assert.strictEqual(values[key], before.series[i][key], `${preset}: ${key} value differs at bar ${i}`);
+            }
+        });
+    }
+});
 for (const [from, to] of [[1, 5], [5, 1]]) test(`${from}m to ${to}m reset preserves fresh-target state and graphics`, () => {
     const before = make(baselineModule, from, {}), after = make(candidateModule, from, {});
     const oldBars = input('2026-10-04T22:00:00Z', 3, from), targetBars = input('2026-10-04T22:00:00Z', 3, to);
     run(before, oldBars, false); run(after, oldBars, false);
     before.chartDescription.elementSize = to; after.chartDescription.elementSize = to;
     const expected = run(before, targetBars, true), actual = run(after, targetBars, true), fresh = run(make(candidateModule, to, {}), targetBars, true);
-    assert.equal(actual.output, expected.output); assert.equal(actual.state, expected.state);
+    assert.equal(actual.values, expected.values); assert.equal(actual.state, expected.state);
     assert.equal(actual.output, fresh.output); assert.equal(actual.state, fresh.state);
 });
 for (const interval of [1, 5]) test(`${interval}m history prepend/reindex reset preserves fresh state and graphics`, () => {
@@ -129,7 +183,7 @@ for (const interval of [1, 5]) test(`${interval}m history prepend/reindex reset 
     const before = make(baselineModule, interval, {}), after = make(candidateModule, interval, {});
     run(before, short, false); run(after, short, false);
     const expected = run(before, bars, false), actual = run(after, bars, false), fresh = run(make(candidateModule, interval, {}), bars, true);
-    assert.equal(actual.output, expected.output); assert.equal(actual.state, expected.state);
+    assert.equal(actual.values, expected.values); assert.equal(actual.state, expected.state);
     assert.equal(actual.output, fresh.output); assert.equal(actual.state, fresh.state);
 });
 for (const interval of [1, 5]) for (const latestOnly of [false, true]) for (const replacement of [false, true]) test(`${interval}m finite ${replacement ? 'replacement' : 'shortened'} history ${latestOnly ? 'latest-only' : 'sequential'} resets once and equals fresh target`, () => {
