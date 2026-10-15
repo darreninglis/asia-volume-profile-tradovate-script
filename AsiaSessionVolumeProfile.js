@@ -362,10 +362,15 @@ function normalizeSettings(supplied) {
 
 class AsiaSessionVolumeProfile {
     init() {
+        const described=Number(this.chartDescription && this.chartDescription.elementSize),contract=this.contractInfo.contract;
+        if(this.interval && this.interval.contract===contract)this.retainMinuteHistory();
+        else this.minuteHistory=null;
+        if(!this.interval || this.interval.described!==described || this.interval.contract!==contract)this.interval={described,minutes:described,contract};
+        this.intervalScan=null;
         this.props=normalizeSettings(this.props);
         this.view=displaySettings(this.props);
         this.histogramCache=new Map();
-        this.minutes=Number(this.chartDescription && this.chartDescription.elementSize);
+        this.minutes=this.interval.minutes;
         this.duration=([1,5].includes(this.minutes)?this.minutes:1)*MIN;
         this.inputWarning=null;this.drawCache=null;
         this.tick=this.contractInfo.tickSize;this.step=this.tick*this.props.ticksPerRow;
@@ -377,6 +382,53 @@ class AsiaSessionVolumeProfile {
         this.snapshot={};this.references=new ReferenceOverlays(this.props,this.tick,this.duration);
     }
     supported() {const d=this.chartDescription;return !!d && d.underlyingType==='MinuteBar' && [1,5].includes(Number(d.elementSize)) && d.elementSizeUnit==='UnderlyingUnits';}
+    // Preserve a single supplied 1m history across the host's repeated init calls.
+    // It is evidence for an interval change, never a source of profile volume.
+    retainMinuteHistory() {
+        const items=this.historyBars && this.historyBars.items;
+        if(this.minutes!==1 || !items || items.length<15)return;
+        if(!items.some((b,i)=>b && i && items[i-1] && b.t-items[i-1].t===MIN))return;
+        this.minuteHistory=new Map(items.filter(Boolean).map(b=>[b.t,b]));
+    }
+    resolveInterval(history,first,d,index) {
+        if(!history || typeof history.size!=='function' || typeof history.get!=='function')return this.minutes;
+        const size=history.size();if(!Number.isInteger(size) || size<2)return this.minutes;
+        const at=i=>i===index?d:history.get(i),second=at(1),tail=at(size-1);
+        const stamp=b=>b?+new Date(b.timestamp()):NaN;
+        const key=[stamp(first),stamp(second),stamp(tail),size].join(':');
+        if(this.intervalScan && this.intervalScan.key===key)return this.intervalScan.minutes;
+        const finish=minutes=>{this.intervalScan={key,minutes};return minutes;};
+        // A real one-minute adjacent pair proves 1m; a large gap proves nothing.
+        for(const start of [0,Math.max(0,size-16)])for(let i=start;i<Math.min(size-1,start+15);i++) {
+            const a=at(i),b=at(i+1);
+            if(stamp(b)-stamp(a)===MIN)return finish(1);
+        }
+        if(this.minutes!==1)return finish(this.minutes);
+        this.retainMinuteHistory();
+        if(!this.minuteHistory)return finish(this.minutes);
+        // Prove coarsening against three consecutive closed 5m candles. Every
+        // OHLCV field must equal all five previously supplied, closed 1m bars.
+        // Sparse timestamps alone can never promote a 1m profile to 5m.
+        let matched=0,next=null,individual=0,cadence=0,previousTime=null;
+        for(let i=size-2;i>=Math.max(0,size-122);i--) {
+            const source=at(i);if(!source)break;
+            const b=bar(source,i),parts=[];
+            if(previousTime!==null && previousTime-b.t===5*MIN)cadence++;
+            previousTime=b.t;
+            const original=this.minuteHistory.get(b.t);
+            if(original && ['o','h','l','c','v'].every(k=>original[k]===b[k]))individual++;
+            for(let j=0;j<5;j++)parts.push(this.minuteHistory.get(b.t+j*MIN));
+            const complete=b.t%(5*MIN)===0 && parts.every(p=>p && [p.o,p.h,p.l,p.c,p.v].every(Number.isFinite) && p.v>0);
+            const same=complete && b.o===parts[0].o && b.c===parts[4].c && b.h===Math.max(...parts.map(p=>p.h)) && b.l===Math.min(...parts.map(p=>p.l)) && b.v===parts.reduce((sum,p)=>sum+p.v,0);
+            matched=same?(next===null || next-b.t===5*MIN?matched+1:1):0;
+            next=same?b.t:null;
+            if(matched===3)return finish(5);
+        }
+        if(individual>=3)return finish(1);
+        // Keep ambiguous replacement data off the chart until it can be proved.
+        // This also protects against corrected or non-overlapping feed history.
+        return finish(cadence?NaN:this.minutes);
+    }
     closeProfile() {
         const p=this.active;if(!p)return;
         if(p.kind==='US') {
@@ -453,8 +505,12 @@ class AsiaSessionVolumeProfile {
         // replacing/prepending history. Replay supplied closed bars after a change;
         // calculation formulas and duplicate protection remain unchanged.
         if(this.supported()) {
-            let reset=Number(this.chartDescription.elementSize)!==this.minutes;
+            if(Number(this.chartDescription.elementSize)!==this.interval.described)this.init();
             const first=history && typeof history.get==='function'?history.get(0):null;
+            const minutes=this.resolveInterval(history,first,d,index);
+            if(!Number.isFinite(minutes))return last?{dataReady:0,contextState:0,graphics:{items:this.warning('Waiting to confirm chart interval from closed history')}}:{};
+            let reset=minutes!==this.minutes;
+            if(reset)this.interval.minutes=minutes;
             const start=first?+new Date(first.timestamp()):NaN;
             // The host can replace the opening prefix while retaining the latest
             // sequence/timestamp. That still requires a complete history replay.

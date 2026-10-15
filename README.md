@@ -14,6 +14,8 @@ The `./tools/predef` and `./tools/graphics` imports are provided by Tradovate. N
 
 ## Profile behavior
 
+The timeframe-recovery changes on this branch are an unpublished candidate. All 158 local checks pass, but live switching verification is blocked by a custom-loader initialization failure after refresh. Tradovate was restored to the published `f211cf8` source. Do not describe this branch as a verified refresh fix.
+
 - Asia/overnight session: 18:00–09:30 New York time.
 - US cash session: 09:30–16:00 New York time, weekdays.
 - New York daylight-saving time is handled by the script.
@@ -29,9 +31,11 @@ Load history back to the session opening for a complete profile. “Complete” 
 
 The indicator replays supplied history when its opening timestamp changes, when history is replaced or shortened, or when a revisited closed candle changes. Corrections that arrive only in the history collection are checked at the next new chart candle. Reload to check those corrections immediately. The indicator cannot recover bars Tradovate has not supplied.
 
-After changing between 1-minute and 5-minute charts, Tradovate can retain the previous `chartDescription.elementSize`. Reloading supplies fresh interval metadata, but see the loader limitation below. Creating a new chart after selecting the desired interval also supplied correct metadata in the October 15 checks. Keeping separate 1-minute and 5-minute chart tabs avoids changing an existing instance's interval. The script uses the documented metadata and does not guess an interval from gaps between sparse bars.
+Tradovate can retain the previous `chartDescription.elementSize` after changing intervals. The indicator now checks the supplied history and can recover automatically: an adjacent one-minute pair proves 1m, while three consecutive closed 5m candles must exactly match the open, high, low, close and summed volume of all five previously supplied closed 1m bars. A single previous minute-history snapshot survives the host's repeated initialization calls and is discarded when the contract changes. It is used only to verify the interval; calculations always use the current supplied bars.
 
-If **all custom-indicator categories disappear after a refresh**, a failure of Tradovate's shared custom-indicator loader was observed during this session with both the previous release and the updated script. Fresh sign-ins restored the custom catalog during these checks. This is a recovery attempt, not a guaranteed fix; saving the script or refreshing alone did not consistently restore it.
+Gaps alone never establish a 5m chart. If replacement history cannot be confirmed (for example, corrected volumes, insufficient overlap or missing constituent bars), the indicator displays “Waiting to confirm chart interval from closed history” and suppresses profile/VWAP outputs until there is enough evidence or corrected host metadata. No absent volume is reconstructed.
+
+If **all custom-indicator categories disappear after a refresh**, a failure of Tradovate's shared custom-indicator loader was observed with the previous release, updated source and a minimal calculation-free control, even with all other community packages temporarily disabled. Reimporting the saved workspace did not restore it. The original source and package settings were restored. Fresh sign-ins restored the custom catalog in earlier checks, but that is not a fix for refresh reliability. An indicator cannot recover itself while the host has not loaded its code; the precise browser/platform loader cause remains unconfirmed.
 
 ## Display presets
 

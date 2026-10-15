@@ -1,5 +1,14 @@
 # Changes
 
+## 2026-10-15 — Stale timeframe metadata recovery
+
+- Candidate only: 158 local checks pass, including calculation parity across 85,152 historical bars. Live switching/reload verification is blocked by the custom-loader failure described below; this candidate has not been published.
+- Retain one supplied minute-history snapshot across Tradovate's repeated initialization calls, then recover 1m from an adjacent minute pair or 5m from three consecutive exact OHLCV aggregation matches. Never infer 5m from sparse timestamps alone.
+- Cache interval checks between unchanged live updates and discard cross-contract evidence.
+- Suppress profile/VWAP outputs with a clear waiting message when replacement history cannot establish the interval safely.
+- Add repeated-switch, host-initialization, sparse-data, OHLCV-mismatch, contract-change and ambiguous-history recovery regressions. All profile and context formulas remain unchanged.
+- Refresh diagnosis: normal browser refresh and automated refresh both lost the Custom catalog. Reimporting a saved workspace did not restore it. Disabling all five installed community packages and replacing the Asia module temporarily with a 210-character calculation-free control also failed. The published Asia source and all five enabled package states were restored afterward. The precise platform/browser loader cause remains unconfirmed.
+
 ## 2026-10-15 — Presentation and data-quality cleanup
 
 - Add Custom, Essential, Session Context and Full References display presets. Custom remains the compatibility default; presets change visibility without changing calculations.
